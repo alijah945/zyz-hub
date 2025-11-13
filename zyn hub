@@ -1,0 +1,709 @@
+--// Flick Suite — Arena-safe Premium Build
+--// Key: zyz | RightShift open/close | Humanized Aimbot toggle | Neon GUI (scrollable)
+--// ESP: smooth boxes, skeleton, health bars, tracers, offscreen arrows | Camera/respawn safe
+
+-- Services
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local Workspace  = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Drawing (executor-provided)
+local DrawingLib = Drawing or (getgenv and getgenv().Drawing)
+local DRAWING_AVAILABLE = (DrawingLib ~= nil)
+
+-- Hub state
+local Hub = {
+    Authenticated = false,
+    OverlaysVisible = true,
+    GUIVisible = true,  -- ADD THIS LINE
+    Settings = {
+        Key = "zyz",
+        Aimbot = {
+            Enabled = true,
+            HoldToAim = true,     -- right-click gate
+            FOV = 160,
+            Smooth = true,
+            SmoothSpeed = 10,
+            TargetPart = "Head",  -- Head | Torso | Any
+            Humanize = false,
+        },
+        ESP = {
+            Enabled = true,
+            MaxDistance = 1500,
+            Boxes = true,
+            Names = true,
+            Distance = true,
+            HealthBars = true,
+            Skeleton = true,
+            Tracers = true,
+            OffscreenArrows = true,
+        },
+        Visuals = {
+            FOVColor = Color3.fromRGB(0,255,160),
+            Crosshair = true,
+            CrosshairColor = Color3.fromRGB(230,255,250),
+            CrosshairGap = 6,
+            CrosshairLength = 10,
+            CrosshairThickness = 1,
+        },
+        UI = { ToggleKey = Enum.KeyCode.RightShift }
+    },
+    GUI = { Main = nil },
+    Drawings = {
+        FOVCircle = nil,
+        Crosshair = {},
+        PerPlayer = {} -- [Player] = {Box, Text, HealthBG, HealthFG, Tracer, Arrow, Skeleton={}}
+    }
+}
+
+-- Helpers
+local function notify(title, text, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title=title, Text=text, Duration=dur or 3})
+    end)
+end
+
+local function screenCenter(camera)
+    local vps = camera.ViewportSize
+    return Vector2.new(vps.X/2, vps.Y/2)
+end
+
+local function getTargetPart(character)
+    local mode = Hub.Settings.Aimbot.TargetPart
+    if mode == "Head" then
+        return character:FindFirstChild("Head")
+    elseif mode == "Torso" then
+        return character:FindFirstChild("HumanoidRootPart")
+            or character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("Torso")
+    else -- Any
+        return character:FindFirstChild("Head")
+            or character:FindFirstChild("HumanoidRootPart")
+            or character:FindFirstChildWhichIsA("BasePart")
+    end
+end
+
+-- Drawing pool per player
+local function ensurePlayerDrawings(p)
+    if not DRAWING_AVAILABLE then return nil end
+    local entry = Hub.Drawings.PerPlayer[p]
+    if entry then return entry end
+
+    entry = {
+        Box      = DrawingLib.new("Square"),
+        Text     = DrawingLib.new("Text"),
+        HealthBG = DrawingLib.new("Square"),
+        HealthFG = DrawingLib.new("Square"),
+        Tracer   = DrawingLib.new("Line"),
+        Arrow    = DrawingLib.new("Triangle"),
+        Skeleton = {}
+    }
+
+    entry.Box.Thickness = 1
+    entry.Box.Filled = false
+    entry.Box.Color = Color3.fromRGB(255,255,255)
+
+    entry.Text.Size = 14
+    entry.Text.Center = true
+    entry.Text.Outline = true
+    entry.Text.Color = Color3.fromRGB(0,255,255)
+
+    entry.HealthBG.Filled = true
+    entry.HealthBG.Color = Color3.fromRGB(30,30,30)
+    entry.HealthFG.Filled = true
+
+    entry.Tracer.Thickness = 1
+    entry.Tracer.Color = Color3.fromRGB(255,255,0)
+
+    entry.Arrow.Filled = true
+    entry.Arrow.Color = Color3.fromRGB(255,220,0)
+
+    Hub.Drawings.PerPlayer[p] = entry
+    return entry
+end
+
+local function hideAll(entry)
+    if not entry then return end
+    entry.Box.Visible = false
+    entry.Text.Visible = false
+    entry.HealthBG.Visible = false
+    entry.HealthFG.Visible = false
+    entry.Tracer.Visible = false
+    entry.Arrow.Visible = false
+    for _, line in pairs(entry.Skeleton) do line.Visible = false end
+end
+
+-- Cleanup when player leaves
+Players.PlayerRemoving:Connect(function(plr)
+    local entry = Hub.Drawings.PerPlayer[plr]
+    if entry then
+        pcall(function()
+            if entry.Box then entry.Box:Remove() end
+            if entry.Text then entry.Text:Remove() end
+            if entry.HealthBG then entry.HealthBG:Remove() end
+            if entry.HealthFG then entry.HealthFG:Remove() end
+            if entry.Tracer then entry.Tracer:Remove() end
+            if entry.Arrow then entry.Arrow:Remove() end
+            for _,line in pairs(entry.Skeleton) do pcall(function() line:Remove() end) end
+        end)
+        Hub.Drawings.PerPlayer[plr] = nil
+    end
+end)
+
+-- Rebuild drawings when players respawn (prevents lobby positions sticking after arena teleport)
+local function hookRespawn(plr)
+    plr.CharacterAdded:Connect(function()
+        -- Force a fresh drawing set next tick
+        local old = Hub.Drawings.PerPlayer[plr]
+        if old then
+            hideAll(old)
+            Hub.Drawings.PerPlayer[plr] = nil
+        end
+    end)
+end
+for _, plr in ipairs(Players:GetPlayers()) do hookRespawn(plr) end
+Players.PlayerAdded:Connect(hookRespawn)
+
+-- Skeleton map (R15-friendly best-effort)
+local skeletonMap = {
+    {"Head","UpperTorso"}, {"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"}, {"LeftUpperArm","LeftLowerArm"},
+    {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},
+    {"LowerTorso","LeftUpperLeg"}, {"LeftUpperLeg","LeftLowerLeg"},
+    {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},
+}
+
+-- Build visuals: FOV + Crosshair
+local function buildVisuals()
+    if not DRAWING_AVAILABLE then
+        notify("Flick Suite", "Drawing API not available. Visuals disabled.", 4)
+        return
+    end
+
+    -- FOV circle
+    local circle = DrawingLib.new("Circle")
+    circle.Thickness = 1
+    circle.Filled = false
+    circle.NumSides = 64
+    Hub.Drawings.FOVCircle = circle
+
+    -- Crosshair lines
+    local function newLine()
+        local l = DrawingLib.new("Line")
+        l.Thickness = Hub.Settings.Visuals.CrosshairThickness
+        l.Color = Hub.Settings.Visuals.CrosshairColor
+        return l
+    end
+    Hub.Drawings.Crosshair = {newLine(), newLine(), newLine(), newLine()}
+
+    RunService.RenderStepped:Connect(function()
+        if not Hub.OverlaysVisible then
+            circle.Visible = false
+            for _, line in ipairs(Hub.Drawings.Crosshair) do line.Visible = false end
+            return
+        end
+
+        local camera = Workspace.CurrentCamera
+        local center = screenCenter(camera)
+
+        -- FOV circle
+        circle.Position = center
+        circle.Radius = Hub.Settings.Aimbot.FOV
+        circle.Color = Hub.Settings.Visuals.FOVColor
+        circle.Visible = Hub.Settings.Aimbot.Enabled
+
+        -- Crosshair
+        local gap, len = Hub.Settings.Visuals.CrosshairGap, Hub.Settings.Visuals.CrosshairLength
+        local t,b,l,r = Hub.Drawings.Crosshair[1], Hub.Drawings.Crosshair[2], Hub.Drawings.Crosshair[3], Hub.Drawings.Crosshair[4]
+
+        t.From = Vector2.new(center.X, center.Y - gap)
+        t.To   = Vector2.new(center.X, center.Y - (gap + len))
+        b.From = Vector2.new(center.X, center.Y + gap)
+        b.To   = Vector2.new(center.X, center.Y + (gap + len))
+        l.From = Vector2.new(center.X - gap, center.Y)
+        l.To   = Vector2.new(center.X - (gap + len), center.Y)
+        r.From = Vector2.new(center.X + gap, center.Y)
+        r.To   = Vector2.new(center.X + (gap + len), center.Y)
+
+        for _, line in ipairs(Hub.Drawings.Crosshair) do
+            line.Color = Hub.Settings.Visuals.CrosshairColor
+            line.Thickness = Hub.Settings.Visuals.CrosshairThickness
+            line.Visible = Hub.Settings.Visuals.Crosshair and Hub.OverlaysVisible
+        end
+    end)
+end
+
+-- ESP loop (camera-safe, respawn-safe, offscreen-safe, clamped sizes)
+RunService.RenderStepped:Connect(function()
+    if not Hub.Authenticated or not Hub.OverlaysVisible then return end
+    if not DRAWING_AVAILABLE or not Hub.Settings.ESP.Enabled then return end
+
+    local camera = Workspace.CurrentCamera -- re-fetch each frame
+    local center = screenCenter(camera)
+    local screen = camera.ViewportSize
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local char = p.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local entry = ensurePlayerDrawings(p)
+            if not entry then continue end
+
+            if not hum or not hrp or hum.Health <= 0 then
+                hideAll(entry)
+            else
+                local dist = (hrp.Position - camera.CFrame.Position).Magnitude
+                if Hub.Settings.ESP.MaxDistance and dist > Hub.Settings.ESP.MaxDistance then
+                    hideAll(entry)
+                else
+                    local head = char:FindFirstChild("Head")
+                    local headPos = (head and head.Position) or hrp.Position
+
+                    local root2, rootOn = camera:WorldToViewportPoint(hrp.Position)
+                    local head2, headOn = camera:WorldToViewportPoint(headPos)
+
+                    if rootOn and headOn then
+                        -- Box sizing (clamped)
+                        local top2    = camera:WorldToViewportPoint(headPos + Vector3.new(0, 0.5, 0))
+                        local bottom2 = camera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3.5, 0))
+                        local height  = math.clamp(math.abs(top2.Y - bottom2.Y), 22, 400)
+                        local width   = math.clamp(height * 0.58, 12, 200)
+                        local yTop    = math.min(top2.Y, bottom2.Y)
+                        local xLeft   = head2.X - width/2
+                        local targetPos = Vector2.new(xLeft, yTop)
+
+                        -- Smooth position (lerp)
+                        if entry.Box.Position then
+                            entry.Box.Position = entry.Box.Position:Lerp(targetPos, 0.35)
+                        else
+                            entry.Box.Position = targetPos
+                        end
+                        entry.Box.Size    = Vector2.new(width, height)
+                        entry.Box.Visible = Hub.Settings.ESP.Boxes and Hub.OverlaysVisible
+
+                        -- Name + distance
+                        if Hub.Settings.ESP.Names or Hub.Settings.ESP.Distance then
+                            local label = ""
+                            if Hub.Settings.ESP.Names then label = p.Name end
+                            if Hub.Settings.ESP.Distance then
+                                label = label .. (label ~= "" and " " or "") .. "["..math.floor(dist).."m]"
+                            end
+                            entry.Text.Text = label
+                            entry.Text.Position = Vector2.new(xLeft + width/2, yTop - 16)
+                            entry.Text.Visible = Hub.OverlaysVisible
+                        else
+                            entry.Text.Visible = false
+                        end
+
+                        -- Health bar
+                        if Hub.Settings.ESP.HealthBars then
+                            local hpPercent = hum.Health / math.max(hum.MaxHealth, 1)
+                            local hbW = 4
+                            local hbX = entry.Box.Position.X - hbW - 2
+                            entry.HealthBG.Position = Vector2.new(hbX, entry.Box.Position.Y)
+                            entry.HealthBG.Size = Vector2.new(hbW, entry.Box.Size.Y)
+                            entry.HealthBG.Visible = Hub.OverlaysVisible
+
+                            entry.HealthFG.Position = Vector2.new(hbX, entry.Box.Position.Y + (entry.Box.Size.Y * (1 - hpPercent)))
+                            entry.HealthFG.Size = Vector2.new(hbW, entry.Box.Size.Y * hpPercent)
+                            entry.HealthFG.Color = Color3.fromRGB(255 * (1 - hpPercent), 255 * hpPercent, 0)
+                            entry.HealthFG.Visible = Hub.OverlaysVisible
+                        else
+                            entry.HealthBG.Visible = false
+                            entry.HealthFG.Visible = false
+                        end
+
+                        -- Tracer
+                        entry.Tracer.From = center
+                        entry.Tracer.To   = Vector2.new(root2.X, root2.Y)
+                        entry.Tracer.Visible = Hub.Settings.ESP.Tracers and Hub.OverlaysVisible
+
+                        -- Skeleton
+                        if Hub.Settings.ESP.Skeleton then
+                            for _, pair in ipairs(skeletonMap) do
+                                local a = char:FindFirstChild(pair[1])
+                                local b = char:FindFirstChild(pair[2])
+                                if a and b then
+                                    local a2, onA = camera:WorldToViewportPoint(a.Position)
+                                    local b2, onB = camera:WorldToViewportPoint(b.Position)
+                                    local key = (a.Name .. ":" .. b.Name)
+                                    local line = entry.Skeleton[key]
+                                    if not line then
+                                        line = DrawingLib.new("Line")
+                                        entry.Skeleton[key] = line
+                                    end
+                                    if onA and onB then
+                                        line.From = Vector2.new(a2.X, a2.Y)
+                                        line.To   = Vector2.new(b2.X, b2.Y)
+                                        line.Color = Color3.fromRGB(0,255,0)
+                                        line.Visible = Hub.OverlaysVisible
+                                    else
+                                        line.Visible = false
+                                    end
+                                end
+                            end
+                        else
+                            for _, line in pairs(entry.Skeleton) do line.Visible = false end
+                        end
+
+                        -- Hide arrow on-screen
+                        entry.Arrow.Visible = false
+                    else
+                        -- Offscreen arrows (stable direction)
+                        if Hub.Settings.ESP.OffscreenArrows then
+                            local headProj = Vector2.new(head2.X, head2.Y)
+                            local dir = (headProj - center)
+                            if dir.Magnitude < 1e-3 then dir = Vector2.new(1,0) end
+                            dir = dir.Unit
+                            local radius = math.min(screen.X, screen.Y) * 0.45
+                            local tip = center + dir * radius
+                            local perp = Vector2.new(-dir.Y, dir.X)
+                            entry.Arrow.PointA = tip
+                            entry.Arrow.PointB = tip - dir * 12 + perp * 6
+                            entry.Arrow.PointC = tip - dir * 12 - perp * 6
+                            entry.Arrow.Visible = Hub.OverlaysVisible
+                        else
+                            entry.Arrow.Visible = false
+                        end
+                        -- Hide other drawings when offscreen to prevent "sticking"
+                        entry.Box.Visible = false
+                        entry.Text.Visible = false
+                        entry.HealthBG.Visible = false
+                        entry.HealthFG.Visible = false
+                        entry.Tracer.Visible = false
+                        for _, line in pairs(entry.Skeleton) do line.Visible = false end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Aimbot loop (right-click gate + humanize + smooth aim, camera-safe)
+RunService.RenderStepped:Connect(function(dt)
+    if not Hub.Authenticated or not Hub.OverlaysVisible then return end
+    if not Hub.Settings.Aimbot.Enabled then return end
+    if Hub.Settings.Aimbot.HoldToAim and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then return end
+
+    local camera = Workspace.CurrentCamera
+    if DRAWING_AVAILABLE and Hub.Drawings.FOVCircle then
+        Hub.Drawings.FOVCircle.Position = screenCenter(camera)
+        Hub.Drawings.FOVCircle.Radius = Hub.Settings.Aimbot.FOV
+        Hub.Drawings.FOVCircle.Color = Hub.Settings.Visuals.FOVColor
+        Hub.Drawings.FOVCircle.Visible = true
+    end
+
+    local center = screenCenter(camera)
+    local closestPart, closestDist = nil, math.huge
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local part = getTargetPart(p.Character) or p.Character:FindFirstChild("HumanoidRootPart")
+                if part then
+                    local pos, onScreen = camera:WorldToViewportPoint(part.Position)
+                    if onScreen then
+                        local d2 = (Vector2.new(pos.X, pos.Y) - center).Magnitude
+                        if d2 < Hub.Settings.Aimbot.FOV and d2 < closestDist then
+                            closestPart, closestDist = part, d2
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if closestPart then
+        local targetPos = closestPart.Position
+        if Hub.Settings.Aimbot.Humanize then
+            targetPos = targetPos + Vector3.new(
+                math.random(-2,2)/10,
+                math.random(-2,2)/10,
+                math.random(-2,2)/10
+            )
+        end
+        local goal = CFrame.new(camera.CFrame.Position, targetPos)
+        if Hub.Settings.Aimbot.Smooth then
+            local speed = Hub.Settings.Aimbot.SmoothSpeed
+            if Hub.Settings.Aimbot.Humanize then
+                speed = speed + math.random(-2,2)
+            end
+            local alpha = math.clamp(dt * speed, 0, 1)
+            camera.CFrame = camera.CFrame:Lerp(goal, alpha)
+        else
+            camera.CFrame = goal
+        end
+    end
+end)
+
+-- Neon GUI (scrollable) + Loader with key "zyz"
+local function buildGUI()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "FlickSuiteGUI"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.Enabled = true
+    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local window = Instance.new("Frame")
+    window.Size = UDim2.fromOffset(460, 560)
+    window.Position = UDim2.fromScale(0.5, 0.5) - UDim2.fromOffset(230, 280)
+    window.BackgroundColor3 = Color3.fromRGB(16, 18, 22)
+    window.BorderSizePixel = 0
+    window.Active = true
+    window.Draggable = true
+    window.Parent = gui
+
+    local stroke = Instance.new("UIStroke", window)
+    stroke.Thickness = 2
+    stroke.Color = Color3.fromRGB(0, 255, 160)
+    local corner = Instance.new("UICorner", window)
+    corner.CornerRadius = UDim.new(0, 10)
+
+    local header = Instance.new("TextLabel", window)
+    header.Size = UDim2.new(1, 0, 0, 30)
+    header.BackgroundTransparency = 1
+    header.Text = "Flick Suite — Premium"
+    header.Font = Enum.Font.GothamBold
+    header.TextSize = 18
+    header.TextColor3 = Color3.fromRGB(230, 255, 250)
+
+    local tabsBar = Instance.new("Frame", window)
+    tabsBar.Size = UDim2.new(1, 0, 0, 40)
+    tabsBar.Position = UDim2.new(0, 0, 0, 36)
+    tabsBar.BackgroundColor3 = Color3.fromRGB(24, 26, 30)
+    local tabsCorner = Instance.new("UICorner", tabsBar)
+    tabsCorner.CornerRadius = UDim.new(0, 8)
+    local tabLayout = Instance.new("UIListLayout", tabsBar)
+    tabLayout.FillDirection = Enum.FillDirection.Horizontal
+    tabLayout.Padding = UDim.new(0, 8)
+    tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+
+    local content = Instance.new("Frame", window)
+    content.Size = UDim2.new(1, 0, 1, -100)
+    content.Position = UDim2.new(0, 0, 0, 84)
+    content.BackgroundColor3 = Color3.fromRGB(20, 22, 26)
+    local contentCorner = Instance.new("UICorner", content)
+    contentCorner.CornerRadius = UDim.new(0, 8)
+
+    -- Key system (loader)
+    local keyFrame = Instance.new("Frame", window)
+    keyFrame.Size = UDim2.new(1, 0, 0, 70)
+    keyFrame.Position = UDim2.new(0, 0, 1, -70)
+    keyFrame.BackgroundColor3 = Color3.fromRGB(24, 26, 30)
+    local keyCorner = Instance.new("UICorner", keyFrame)
+    keyCorner.CornerRadius = UDim.new(0, 8)
+
+    local keyLabel = Instance.new("TextLabel", keyFrame)
+    keyLabel.Size = UDim2.new(1, -200, 1, 0)
+    keyLabel.Position = UDim2.new(0, 12, 0, 0)
+    keyLabel.BackgroundTransparency = 1
+    keyLabel.Text = "Enter key to unlock: zyz"
+    keyLabel.TextColor3 = Color3.fromRGB(230, 255, 250)
+    keyLabel.Font = Enum.Font.Gotham
+    keyLabel.TextSize = 14
+
+    local keyBox = Instance.new("TextBox", keyFrame)
+    keyBox.Size = UDim2.new(0, 190, 0, 36)
+    keyBox.Position = UDim2.new(1, -206, 0.5, -18)
+    keyBox.PlaceholderText = "key..."
+    keyBox.Text = ""
+    keyBox.TextColor3 = Color3.fromRGB(230, 255, 250)
+    keyBox.Font = Enum.Font.Gotham
+    keyBox.TextSize = 14
+    keyBox.BackgroundColor3 = Color3.fromRGB(32, 34, 38)
+    local kbCorner = Instance.new("UICorner", keyBox)
+    kbCorner.CornerRadius = UDim.new(0, 8)
+    local kbStroke = Instance.new("UIStroke", keyBox)
+    kbStroke.Color = Color3.fromRGB(0, 255, 160)
+    kbStroke.Thickness = 1
+
+    local function lockControls(state)
+        tabsBar.Visible = state
+        content.Visible = state
+    end
+    lockControls(false)
+
+    local splash = Instance.new("TextLabel", window)
+    splash.Size = UDim2.new(1, 0, 0, 36)
+    splash.Position = UDim2.new(0, 0, 0, 0)
+    splash.BackgroundColor3 = Color3.fromRGB(0, 180, 120)
+    splash.Text = "Thanks for buying"
+    splash.TextColor3 = Color3.fromRGB(255, 255, 255)
+    splash.Font = Enum.Font.GothamBold
+    splash.TextSize = 18
+    local splashCorner = Instance.new("UICorner", splash)
+    splashCorner.CornerRadius = UDim.new(0, 8)
+    splash.Visible = false
+
+    keyBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            if string.lower(keyBox.Text) == string.lower(Hub.Settings.Key) then
+                Hub.Authenticated = true
+                lockControls(true)
+                splash.Visible = true
+                task.delay(3, function() splash.Visible = false end)
+                keyFrame.Visible = false
+                notify("Flick Suite", "Key accepted. Welcome!", 3)
+            else
+                notify("Flick Suite", "Invalid key. Required: zyz", 3)
+            end
+        end
+    end)
+
+    -- Pages
+    local pages = {}
+    local function makePage(name)
+        local page = Instance.new("ScrollingFrame", content)
+        page.Name = name
+        page.Size = UDim2.new(1, 0, 1, 0)
+        page.CanvasSize = UDim2.new(0, 0, 0, 0)
+        page.ScrollBarThickness = 6
+        page.ScrollingDirection = Enum.ScrollingDirection.Y
+        page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        page.BackgroundTransparency = 1
+        local list = Instance.new("UIListLayout", page)
+        list.Padding = UDim.new(0, 8)
+        list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        page.Visible = false
+        pages[name] = page
+        return page
+    end
+
+    local function makeTab(name, onClick)
+        local btn = Instance.new("TextButton", tabsBar)
+        btn.Size = UDim2.new(0, 110, 1, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(32, 34, 38)
+        local btnCorner = Instance.new("UICorner", btn)
+        btnCorner.CornerRadius = UDim.new(0, 8)
+        local btnStroke = Instance.new("UIStroke", btn)
+        btnStroke.Thickness = 1
+        btnStroke.Color = Color3.fromRGB(0, 255, 160)
+        btn.TextColor3 = Color3.fromRGB(230, 255, 250)
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextSize = 14
+        btn.Text = name
+        btn.AutoButtonColor = false
+        btn.MouseButton1Click:Connect(function()
+            for _, p in pairs(pages) do p.Visible = false end
+            onClick()
+        end)
+        return btn
+    end
+
+    local function addButton(page, label, callback)
+        local b = Instance.new("TextButton", page)
+        b.Size = UDim2.new(1, -32, 0, 40)
+        b.BackgroundColor3 = Color3.fromRGB(28, 30, 34)
+        local bc = Instance.new("UICorner", b)
+        bc.CornerRadius = UDim.new(0, 8)
+        local bs = Instance.new("UIStroke", b)
+        bs.Color = Color3.fromRGB(0, 255, 160)
+        bs.Thickness = 1
+        b.TextColor3 = Color3.fromRGB(220, 255, 240)
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 14
+        b.Text = label
+        b.AutoButtonColor = false
+        b.MouseButton1Click:Connect(function()
+            if callback then callback(b) end
+        end)
+        return b
+    end
+
+    local function addToggle(page, label, initial, setter)
+        return addButton(page, label .. ": " .. (initial and "ON" or "OFF"), function(b)
+            initial = not initial
+            b.Text = label .. ": " .. (initial and "ON" or "OFF")
+            setter(initial)
+        end)
+    end
+
+    local function addCycle(page, label, min, max, step, initial, setter)
+        return addButton(page, string.format("%s: %d", label, initial), function(b)
+            local nextVal = initial + step
+            if nextVal > max then nextVal = min end
+            initial = nextVal
+            b.Text = string.format("%s: %d", label, initial)
+            setter(initial)
+        end)
+    end
+
+    local function addChoice(page, label, choices, initialIndex, setter)
+        local idx = initialIndex
+        return addButton(page, label .. ": " .. tostring(choices[idx]), function(b)
+            idx = (idx % #choices) + 1
+            b.Text = label .. ": " .. tostring(choices[idx])
+            setter(choices[idx])
+        end)
+    end
+
+    -- Build pages and tabs
+    local pageAimbot   = makePage("Aimbot")
+    local pageESP      = makePage("ESP")
+    local pageVisuals  = makePage("Visuals")
+
+    makeTab("Aimbot", function() pageAimbot.Visible = true end)
+    makeTab("ESP", function() pageESP.Visible = true end)
+    makeTab("Visuals", function() pageVisuals.Visible = true end)
+    pageAimbot.Visible = true
+
+    -- Aimbot controls
+    addToggle(pageAimbot, "Aimbot", Hub.Settings.Aimbot.Enabled, function(v) Hub.Settings.Aimbot.Enabled = v end)
+    addToggle(pageAimbot, "Hold to aim (RMB)", Hub.Settings.Aimbot.HoldToAim, function(v) Hub.Settings.Aimbot.HoldToAim = v end)
+    addCycle(pageAimbot, "FOV", 40, 300, 10, Hub.Settings.Aimbot.FOV, function(v) Hub.Settings.Aimbot.FOV = v end)
+    addToggle(pageAimbot, "Smooth", Hub.Settings.Aimbot.Smooth, function(v) Hub.Settings.Aimbot.Smooth = v end)
+    addCycle(pageAimbot, "Smooth speed", 4, 20, 1, Hub.Settings.Aimbot.SmoothSpeed, function(v) Hub.Settings.Aimbot.SmoothSpeed = v end)
+    addChoice(pageAimbot, "Target part", {"Head","Torso","Any"},
+        ({Head=1,Torso=2,Any=3})[Hub.Settings.Aimbot.TargetPart] or 1,
+        function(v) Hub.Settings.Aimbot.TargetPart = v end)
+    addToggle(pageAimbot, "Humanize", Hub.Settings.Aimbot.Humanize, function(v) Hub.Settings.Aimbot.Humanize = v end)
+
+    -- ESP controls
+    addToggle(pageESP, "ESP", Hub.Settings.ESP.Enabled, function(v) Hub.Settings.ESP.Enabled = v end)
+    addCycle(pageESP, "Max distance", 300, 3000, 100, Hub.Settings.ESP.MaxDistance, function(v) Hub.Settings.ESP.MaxDistance = v end)
+    addToggle(pageESP, "Boxes", Hub.Settings.ESP.Boxes, function(v) Hub.Settings.ESP.Boxes = v end)
+    addToggle(pageESP, "Names", Hub.Settings.ESP.Names, function(v) Hub.Settings.ESP.Names = v end)
+    addToggle(pageESP, "Distance labels", Hub.Settings.ESP.Distance, function(v) Hub.Settings.ESP.Distance = v end)
+    addToggle(pageESP, "Health bars", Hub.Settings.ESP.HealthBars, function(v) Hub.Settings.ESP.HealthBars = v end)
+    addToggle(pageESP, "Skeleton", Hub.Settings.ESP.Skeleton, function(v) Hub.Settings.ESP.Skeleton = v end)
+    addToggle(pageESP, "Tracers", Hub.Settings.ESP.Tracers, function(v) Hub.Settings.ESP.Tracers = v end)
+    addToggle(pageESP, "Offscreen arrows", Hub.Settings.ESP.OffscreenArrows, function(v) Hub.Settings.ESP.OffscreenArrows = v end)
+
+    -- Visuals controls
+    addToggle(pageVisuals, "Crosshair", Hub.Settings.Visuals.Crosshair, function(v) Hub.Settings.Visuals.Crosshair = v end)
+    addCycle(pageVisuals, "Crosshair gap", 2, 14, 1, Hub.Settings.Visuals.CrosshairGap, function(v) Hub.Settings.Visuals.CrosshairGap = v end)
+    addCycle(pageVisuals, "Crosshair length", 6, 24, 1, Hub.Settings.Visuals.CrosshairLength, function(v) Hub.Settings.Visuals.CrosshairLength = v end)
+    addCycle(pageVisuals, "Crosshair thickness", 1, 4, 1, Hub.Settings.Visuals.CrosshairThickness or 1, function(v) Hub.Settings.Visuals.CrosshairThickness = v end)
+    addChoice(pageVisuals, "FOV color", {"Mint","Cyan","Red","Yellow"}, 1, function(v)
+        local map = {
+            Mint   = Color3.fromRGB(0,255,160),
+            Cyan   = Color3.fromRGB(0,220,255),
+            Red    = Color3.fromRGB(255,60,60),
+            Yellow = Color3.fromRGB(255,220,0)
+        }
+        Hub.Settings.Visuals.FOVColor = map[v] or Hub.Settings.Visuals.FOVColor
+    end)
+
+    -- RightShift toggles GUI only, ESP stays visible
+    UIS.InputBegan:Connect(function(input, gpe)
+        if not gpe and input.KeyCode == Hub.Settings.UI.ToggleKey then
+            Hub.GUIVisible = not Hub.GUIVisible
+            gui.Enabled = Hub.GUIVisible
+            -- Hub.OverlaysVisible stays true, so ESP keeps running
+        end
+    end)
+
+    Hub.GUI.Main = gui
+end
+
+-- Boot
+buildVisuals()
+buildGUI()
+print("✅ Flick Suite — Enter key 'zyz' to unlock. RightShift opens/closes GUI only. ESP stays visible. Hold right-click to aim.")
